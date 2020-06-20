@@ -1,0 +1,133 @@
+Filename: 237-directory-servers-for-all.txt
+Title: All relays are directory servers
+Author: Matthew Finkel
+Created: 29-Jul-2014
+Status: Closed
+Target: 0.2.7.x
+Implemented-in: 0.2.8.1-alpha
+Supersedes: 185
+
+Overview:
+
+      This proposal aims at simplying how users interact directly with
+  the Tor network by turning all relays into directory servers (also
+  known as directory caches), too.  Currently an operator has the
+  options of running a relay, a directory server, or both.  With the
+  acceptance (and implementation) of this proposal the options will be
+  simplified by having (nearly) all relays cache and serve directory
+  documents, without additional configuration.
+
+Motivation:
+
+      Fetching directory documents and descriptors is not always a
+  simple operation for a client. This is especially true and potentially
+  dangerous when the client would prefer querying its guard but its
+  guard is not a directory server. When this is the case, the client
+  must choose and query a distinct directory server. At best this should
+  not be necessary and at worst, it seems, this adds another position
+  within the network for profiling and partitioning users. With the
+  orthogonally proposed move to clients using a single guard, the
+  resulting benefits could be reduced by clients using distinct
+  directory servers. In addition, in the case where the client does not
+  use guards, it is important to have the largest possible amount of
+  diversity in the set of directory servers. In a network where (almost)
+  every relay is a directory server, the profiling and partitioning
+  attack vector is reduced to the guard (for clients who use them),
+  which is already in a privileged position for this. In addition, with
+  the increased set size, relay descriptors and documents are more
+  readily available and it diversifies the providers.
+
+Design:
+
+      The changes needed to achieve this should be simple. Currently all
+  relays download and cache the majority of relay documents in any case,
+  so the slight increased memory usage from downloading all of them should
+  have minimal consequences. There will be necessary logical changes in
+  the client, router, and directory code.
+
+      Currently directory servers are defined as such if they advertise
+  having an open directory port. We can no longer assume this is true. To
+  this end, we will introduce a new server descriptor line.
+
+  	"tunnelled-dir-server" NL
+        [At most once]
+        [No extra arguments]
+
+
+      The presence of this line indicates that the relay accepts
+  tunnelled directory requests. For a relay that implements this
+  proposal, this line MUST be added to its descriptor if it does not
+  advertise a directory port, and the line MAY be added if it also
+  advertises an open directory port. In addition to this, relays will
+  now download and cache all descriptors and documents listed in the
+  consensus, regardless of whether they are deemed useful or usable,
+  exactly like the current directory server behavior. All relays will
+  also accept directory requests when they are tunnelled over a
+  connection established with a BEGIN_DIR cell, the same way these
+  connections are already accepted by bridges and directory servers with
+  an open DirPort.
+
+      Directory Authorities will now assign the V2Dir flag to a server if
+  it supports a version of the directory protocol which is useful to
+  clients and it has at least an open directory port or it has an open
+  and reachable OR port and advertises "tunnelled-dir-server" in its
+  server descriptor.
+
+      Clients choose a directory by using the current criteria with the
+  additional criterion that a server only needs the V2Dir status flag
+  instead of requiring an open DirPort.
+
+Security Considerations and Implications:
+
+      Currently all directory servers are explicitly configured. This is
+  necessary because they must have a configured and reachable external
+  port. However, within Tor, this requires additional configuration and
+  results in a reduced number of directory servers in the network. As a
+  consequence, this could allow an adversary to control a non-negligable
+  fraction of the servers. By increasing the number of directory servers
+  in the network the likelihood of selecting one that is malicious is
+  reduced. Also, with this proposal, it will be more likely that a
+  client's entry guard is also a directory server (as alluded to in
+  Proposal 207). However, the reduced anonymity set created when the
+  guard does not have, or is unwilling to distribute, a specific
+  document still exists. With the increased diversity in the available
+  servers, the impact of this should be reduced.
+
+      Another question that may need further consideration is whether we
+  trust bad directories to be good guards and exits.
+
+Specification:
+
+  	The version 3 directory protocol specification does not
+  currently document the use of directory guards. This spec should be
+  updated to mention the preferred use of directory guards during
+  directory requests. In addition, the new criteria for assigning the
+  V2Dir flag should be documented.
+
+Impact on local resources:
+
+      Should relays attempt to download documents from another mirror
+  before asking an authority? All relays, with minor exceptions, will
+  now contact the authorities for documents, but this will not scale
+  well and will partition users from relays.
+
+      If all relays become directory servers, they will choose to
+  download all documents, regardless of whether they are useful, in case
+  another client does want them. This will have very little impact on
+  the most relays, however on memory constrained relays (BeagleBone,
+  Raspberry Pi, and similar), every megabyte allocated to directory
+  documents is not available for new circuits. For this reason, a new
+  configuration option will be introduced within Tor for these systems,
+  named DirCache, which the operator may choose to set as 0, thus
+  disabling caching of directory documents and denying client directory
+  requests.
+
+Future Considerations:
+
+      Should the DirPort be deprecated at some point in the future?
+
+      Write a proposal requiring that a relay must have the V2Dir flag
+  as a criterion for being a guard.
+
+      Is V2Dir a good name for this? It's the name we currently use, but
+  that's a silly reason to continue using it.

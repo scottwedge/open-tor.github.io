@@ -1,0 +1,13 @@
+# Editor droppings
+\#*\#
+.#*
+*~
+*.swp
+# C stuff
+*.o
+# Diff droppings
+*.orig
+*.rej
+
+# OS X folder cruft
+.DS_Store
