@@ -1,0 +1,277 @@
+Filename: 249-large-create-cells.txt
+Title: Allow CREATE cells with >505 bytes of handshake data
+Authors: Nick Mathewson, Isis Lovecruft
+Created: 23 July 15
+Updated: 13 December 2017
+Status: Accepted
+
+1. Summary
+
+   There have been multiple proposals over the last year or so for
+   adding post-quantum cryptography to Tor's circuit extension
+   handshakes.  (See for example https://eprint.iacr.org/2015/008 or
+   https://eprint.iacr.org/2015/287 .) These proposals share the property
+   that the request and reply for a handshake message do not fit in a
+   single RELAY cell.
+
+   In this proposal I describe a new CREATE2V cell for handshakes that
+   don't fit in a 505-byte CREATE2 cell's HDATA section, and a means for
+   fragmenting these CREATE2V cells across multiple EXTEND2 cells.  I
+   also discuss replies, migration, and DoS-mitigation strategies.
+
+2. CREATE2V and CREATED2V
+
+   First, we add two variable-width cell types, CREATE2V and CREATED2V.
+
+   These cell formats are nearly the same as CREATE2 and CREATED2.  (Here
+   specified using Trunnel.)
+
+     struct create2v_cell_body {
+        /* Handshake type */
+        u16 htype;
+        /* Length of handshake data */
+        u16 hlen;
+        /* Handshake data */
+        u8 hdata[hlen];
+        /* Padding data to be ignored */
+        u8 ignored[];
+     };
+
+     struct created2v_cell_body {
+        /* Handshake reply length */
+        u16 hlen;
+        /* Handshake reply data */
+        u8 hdata[hlen];
+        /* Padding data to be ignored */
+        u8 ignored[];
+     };
+
+   The 'ignored' fields, which extend to the end of the variable-length
+   cells, are reserved.  Initiators MAY set them to any length, and MUST
+   fill them with either zero-valued bytes or pseudo-random bytes.
+   Responders MUST ignore them, regardless of what they contain.  When a
+   CREATE2V cell is generated in response to a set of EXTEND2 cells, these
+   fields are set by the relay that receives the EXTEND2 cells.
+
+   (The purpose of the 'ignored' fields here is future-proofing and
+   padding.)
+
+   Protocols MAY wish to pad to a certain multiple of bytes, or wish to pad
+   the initiator/receiver payloads to be of equal length.  This is
+   encouraged but NOT REQUIRED.
+
+3. Fragmented EXTEND2 cells
+
+   Without changing the current EXTEND2 cell format, we change its
+   semantics:
+
+   If the 'HLEN' field in an EXTEND2 cell describes a handshake data
+   section that would be too long to fit in the EXTEND2 cell's payload,
+   the handshake data of the EXTEND2 cell is to be continued in one or
+   more subsequent EXTEND2 cells.  These subsequent cells MUST have zero
+   link specifiers, handshake type 0xFFFF, and handshake data length
+   field set to zero.
+
+   Similarly, if the 'HLEN' field in an EXTENDED2 cell would be too long
+   to fit into the EXTENDED2 cell's payload, the handshake reply data of
+   the EXTENDED2 cell is to be continued in one or more subsequent
+   EXTENDED2 cells.  These subsequent cells must have the handshake data
+   length field set to zero.
+
+   These cells must be sent on the circuit with no intervening cells.
+   If any intervening cells are received, the receiver SHOULD destroy
+   the circuit.
+
+   Protocols which make use of CREATE(D)2V cells SHOULD send an equal number
+   of cells in either direction, to avoid trivially disclosing information
+   about the direction of the circuit: for example a relay might use the
+   fact that it saw five EXTEND2 cells in one direction and three in the
+   other to easily determine whether it is the middle relay on the onion
+   service-side or the middle relay on the client-side of a rendezvous
+   circuit.
+
+4. Interacting with RELAY_EARLY cells
+
+   The first EXTEND2 cell in a batch must arrive in a RELAY_EARLY cell.
+   The others MAY arrive in RELAY_EARLY cells.  For many handshakes, for
+   the possible lengths of many types of circuits, sending all EXTEND2 cells
+   inside RELAY_EARLY cells will not be possible.  For example, for a
+   fragmented EXTEND2 cell with parts A B C D E, A is the only fragment that
+   MUST be sent within a RELAY_EARLY.  For parts B C D E, these are merely
+   sent as EXTEND2{CREATE2V} cells.
+
+   Note that this change leaks the size of the handshake being used to
+   intermediate relays.  We should analyze this and see whether it matters.
+   Clients and relays MAY send RELAY_DROP cells during circuit
+   construction in order to hide the true size of their handshakes
+   (but they can't send these drop cells inside a train of EXTEND2 or
+   EXTENDED2 cells for a given handshake).
+
+5. Example
+
+   So for example, if we are a client, and we need to send a 2000-byte
+   handshake to extend a circuit from relay X to relay Y, we might send
+   cells as follows:
+
+      EXTEND2 {
+        nspec = 2;
+          lstype = [0x01 || 0x02];          (IPv4 or IPv6 node address)
+          lslen =  [0x04 || 0x16];
+          lspec =  { node address for Y, taking 8 bytes or 16 bytes};
+          lstype = 0x03;                    (An ed25519 node identity)
+          lslen = 32;
+          lspen = { ed25519 node ID for Y, taking 32 bytes }
+        htype = {whatever the handshake type is.}
+        hlen = 2000
+        hdata = { the first 462 bytes of the handshake }
+      }
+      EXTEND2 {
+        nspec = 0;
+        htype = 0xffff;
+        hlen = 0;
+        hdata = { the next 492 bytes of the handshake }
+      }
+      EXTEND2 {
+        nspec = 0;
+        htype = 0xffff;
+        hlen = 0;
+        hdata = { the next 492 bytes of the handshake }
+      }
+      EXTEND2 {
+        nspec = 0;
+        htype = 0xffff;
+        hlen = 0;
+        hdata = { the next 492 bytes of the handshake }
+      }
+      EXTEND2 {
+        nspec = 0;
+        htype = 0xffff;
+        hlen = 0;
+        hdata = { the final 62 bytes of the handshake }
+      }
+
+   Upon receiving this last cell, the relay X would send a create2v cell
+   to Y, containing the entire handshake.
+
+6. Migration
+
+   We can and should implement the EXTEND2 fragmentation feature before
+   we implement anything that uses it.  If we can get it widely deployed
+   before it's needed, we can use the new handshake types whenever both
+   of the involved relays support this proposal.
+
+   Clients MUST NOT send fragmented EXTEND2 cells to relays that don't
+   support them, since this would cause them to close the circuit.
+
+   Relays MAY send CREATE2V and CREATED2V cells to relays that don't
+   support them, since unrecognized cell types are ignored.
+
+6.1. New Subprotocols and Subprotocol Versions
+
+   This proposal introduces, following prop#264, the following new
+   subprotocol numbers and their uses.
+
+6.1.1. Relay Subprotocol
+
+     "Relay 3" -- The OP supports all of "Relay 2", plus support for CREATE2V
+       and CREATED2V cells and their above specification for link-layer
+       authentication specifiers.
+
+6.1.2. Link Subprotocol
+
+     "Link 5": The OP supports all of "Link 1-4", plus support for the new
+       EXTEND2 semantics.  Namely, it understands that an EXTEND2 cell whose
+       "hlen" field is greater than 505 will be followed by further "hdata"
+       in fragmented EXTEND2 cells which MUST follow.  It also understands
+       that the following combination of EXTEND2 payload specifiers
+       indicates that the cell is a continuation of the earlier payload
+       portions:
+
+           nspec = 0;
+           htype = 0xffff;
+           hlen = 0;
+
+6.1.3. Handshake Subprotocol
+
+   Additionally, we introduce a new subprotocol, "Handshake" and the
+   following number assignments for previously occuring instances:
+
+     "Handshake 1" -- The OP supports the TAP handshake.
+
+     "Handshake 2" -- The OP supports the ntor handshake.
+
+   We also reserve the following assignments for future use:
+
+     "Handshake 3" -- The OP supports the "hybrid+null" ntor-like handshake
+       from prop#269.
+
+     "Handshake 4" -- The OP supports a(n as yet unspecified) post-quantum
+       secure hybrid handshake, that is, the "hybrid+null" handshake from
+       "Handshake 3", except with "null" part replaced with another (as yet
+       unspecified) protocol to be composed with the ntor-like ECDH-based
+       handshake.
+
+   Further handshakes MUST be specified with "Handshake" subprotocol
+   numbers, and MUST NOT be specified with "Relay" subprotocol numbers.  The
+   "Relay" subprotocol SHALL be used in the future to denote changes to
+   handshake protocol handling of CREATE* and EXTEND* cells, i.e. CREATE,
+   CREATED, CREATE_FAST, CREATED_FAST, CREATE2, CREATED2, CREATE2V,
+   CREATED2V, EXTEND, EXTENDED, EXTEND2, and EXTENDED2.
+
+   Thus, "Handshake 1" is taken to be synonymous with "Relay 1", and
+   likewise "Handshake 2" is with "Relay 2".
+
+6.2. Subprotocol Recommendations
+
+   After the subprotocol additions above, we change to recommending the
+   following in the consensus:
+
+      recommended-client-protocols […] Link=5 Relay=3 Handshake=2
+      recommended-relay-protocols  […] Link=5 Relay=3 Handshake=2
+      required-client-protocols    […] Link=4-5 Relay=2-3 Handshake=1-2
+      required-relay-protocols     […] Link=3-5 Relay=1-3 Handshake=1-2
+
+6.2. New Consensus Parameters
+
+   We introduce the following new consensus parameters:
+
+     Create2VMaximumData SP int
+        The maximum amount of "hlen" data, in bytes, which may carried in
+        either direction within a set of CREATE(D)2V cells.  (default: 10240)
+
+7. Resource management issues
+
+   This feature requires relays and clients to buffer EXTEND2 cell
+   bodies for incoming cells until the entire CREATE2V/CREATED2V body
+   has arrived.  To avoid memory-related denial-of-service attacks,
+   the buffers allocated for this data need to be counted against the
+   total data usage of the circuit.
+
+   Further, circuits which receive and buffer CREATE(D)2V cells MUST store
+   the time the first buffer chunk was allocated, and use it to inform the
+   OOM manager w.r.t. the amount of data used and its staleness.
+
+
+Appendix A. A rejected idea for migration
+
+   In section 5 above, I gave up on the idea of allowing relay A to
+   extend to relay B with a large CREATE cell when relay A does not
+   support this proposal.
+
+   There are other ways to do this, but they are impressively kludgey.
+   For example, we could have a fake CREATE cell for new handshake types
+   that always elicits a "yes, keep going!" CREATED cell.  Then the
+   client could send the rest of the handshake and receive the rest of
+   the CREATED cell as RELAY cells inside the circuit.
+
+   This design would add an extra round-trip to circuit extension
+   whenever it was used, however, and would violate a number of Tor's
+   assumptions about circuits (e.g., by having half-created circuits,
+   where authentication hasn't actually been performed).  So I'm
+   guessing we shouldn't do that.
+
+Appendix B. Acknowledgements
+
+  This research was supported in part by NSF grants CNS-1111539,
+  CNS-1314637, CNS-1526306, CNS-1619454, and CNS-1640548.
+

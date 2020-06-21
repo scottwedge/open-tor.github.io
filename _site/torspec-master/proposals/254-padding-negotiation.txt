@@ -1,0 +1,416 @@
+Filename: 254-padding-negotiation.txt
+Title: Padding Negotiation
+Authors: Mike Perry
+Created: 01 September 2015
+Status: Needs-Revision
+
+
+0. Overview
+
+This proposal aims to describe mechanisms for requesting various types
+of padding from relays.
+
+These padding primitives are general enough to use to defend against
+both website traffic fingerprinting as well as hidden service circuit
+setup fingerprinting.
+
+
+1. Motivation
+
+Tor already supports both link-level padding via (CELL_PADDING cell
+types), as well as circuit-level padding (via RELAY_COMMAND_DROP relay
+cells).
+
+Unfortunately, there is no way for clients to request padding from
+relays, or request that relays not send them padding to conserve
+bandwidth. This proposal aims to create a mechanism for clients to do
+both of these.
+
+It also establishes consensus parameters to limit the amount of padding
+that relays will send, to prevent custom wingnut clients from requesting
+too much.
+
+
+2. Link-level padding
+
+Padding is most useful if it can defend against a malicious or
+compromised guard node. However, link-level padding is still useful to
+defend against an adversary that can merely observe a Guard node
+externally, such as for low-resolution netflow-based attacks (see
+Proposal 251[1]).
+
+In that scenario, the primary negotiation mechanism we need is a way for
+mobile clients to tell their Guards to stop padding, or to pad less
+often. The following Trunnel payload should cover the needed
+parameters:
+
+  const CHANNELPADDING_COMMAND_STOP = 1;
+  const CHANNELPADDING_COMMAND_START = 2;
+
+  /* The start command tells the relay to alter its min and max netflow
+     timeout range values, and send padding at that rate (resuming
+     if stopped). The stop command tells the relay to stop sending
+     link-level padding. */
+  struct channelpadding_negotiate {
+    u8 version IN [0];
+    u8 command IN [CHANNELPADDING_COMMAND_START, CHANNELPADDING_COMMAND_STOP];
+
+    /* Min must not be lower than the current consensus parameter
+       nf_ito_low. Ignored if command is stop. */
+    u16 ito_low_ms;
+
+    /* Max must not be lower than ito_low_ms. Ignored if command is stop. */
+    u16 ito_high_ms;
+  };
+
+After the above cell is received, the guard should use the 'ito_low_ms' and
+'ito_high_ms' values as the minimum and maximum values (respectively) for
+inactivity before it decides to pad the channel. The actual timeout value is
+randomly chosen between those two values through an appropriate probability
+distribution (see proposal251 for the netflow padding protocol).
+
+More complicated forms of link-level padding can still be specified
+using the primitives in Section 3, by using "leaky pipe" topology to
+send the RELAY commands to the Guard node instead of to later nodes in
+the circuit.
+
+Because the above link-level padding only sends padding cells if the link is
+idle, it can be used in combination with the more complicated circuit-level
+padding below, without compounding overhead effects.
+
+
+3. End-to-end circuit padding
+
+For circuit-level padding, we need the ability to schedule a statistical
+distribution of arbitrary padding to overlay on top of non-padding
+traffic (aka "Adaptive Padding").
+
+The statistical mechanisms that define padding are known as padding
+machines. Padding machines can be hardcoded in Tor, specified in the
+consensus, and custom research machines can be listed in Torrc.
+
+3.1. Padding Machines
+
+Circuits can have either one or two state machines at both the origin and at a
+specified middle hop.
+
+Each state machine can contain up to three states ("Start", "Burst" and "Gap")
+governing their behavior, as well as an "END" state. Not all states need to be
+used.
+
+Each state of a padding machine specifies either:
+  * A histogram describing inter-arrival cell delays; OR
+  * A parameterized delay probability distribution for inter-arrival cell delays
+
+In either case, the lower bound of the delay probability distribution can be
+specified as the start_usec parameter, and/or it can be learned by measuring
+the RTT of the circuit at the middle node. For client-side machines, RTT
+measurement is always set to 0. RTT measurement at the middle node is
+calculated by measuring the difference between the time of arrival of an
+received cell (ie: away from origin) and the time of arrival of a sent cell
+(ie: towards origin). The RTT is continually updated so long as two cells do
+not arrive back-to-back in either direction. If the most recent measured RTT
+value is larger than our measured value so far, this larger value is used. If
+the most recent measured RTT value is lower than our measured value so far, it
+is averaged with our current measured value. (We favor longer RTTs slightly in
+this way, because circuits are growing away from the middle node and becoming
+longer).
+
+If the histogram is used, it has an additional special "infinity" bin that
+means "infinite delay".
+
+The state can also provide an optional parameterized distribution that
+specifies how many total cells (or how many padding cells) can be sent on the
+circuit while the machine is in this state, before it transitions to a new
+state.
+
+Each state of a padding machine can react to the following cell events:
+  * Non-padding cell received
+  * Padding cell received
+  * Non-padding cell sent
+  * Padding cell sent
+
+Additionally, padding machines emit the following internal events to themselves:
+  * Infinity bin was selected
+  * The histogram bins are empty
+  * The length count for this state was exceeded
+
+Each state of the padding machine specifies a set of these events that cause
+it to cancel any pending padding, and a set of events that cause it to
+transition to another state, or transition back itself.
+
+When an event causes a transition to a state (or back to the same state), a
+delay is sampled from the histogram or delay distribution, and padding cell is
+scheduled to be sent after that delay.
+
+If a non-padding cell is sent before the timer, the timer is canceled and a
+new padding delay is chosen.
+
+3.1.1. Histogram Specification
+
+If a histogram is used by a state (as opposed to a fixed parameterized
+distribution), then each of the histograms' fields represent a probability
+distribution that is encoded into bins of exponentially increasing width.
+
+The first bin of the histogram (bin 0) has 0 width, with a delay value of
+start_usec+rtt_estimate (from the machine definition, and rtt estimate above).
+
+The remaining bins are exponentially spaced, starting at this offset and
+covering the range of the histogram, which is range_usec.
+
+The intermediate bins thus divide the timespan range_usec with offset
+start_usec+rtt_estimate, so that smaller bin indexes represent narrower time
+ranges, doubling up until the last bin. The last bin before the "infinity bin"
+thus covers [start_usec+rtt_estimate+range_usec/2,
+start_usec+rtt_estimate+range_usec).
+
+This exponentially increasing bin width allows the histograms to most
+accurately represent small interpacket delay (where accuracy is needed), and
+devote less accuracy to larger timescales (where accuracy is not as
+important).
+
+To sample the delay time to send a padding packet, perform the
+following:
+  * Select a bin weighted by the number of tokens in its index compared to
+    the total.
+  * If the infinity bin is selected, do not schedule padding.
+  * If bin 0 is selected, schedule padding at exactly its time value.
+  * For other bins, uniformly sample a time value between this bin and
+    the next bin, and schedule padding then.
+
+3.1.1.1. Histogram Token Removal
+
+Tokens can be optionally removed from histogram bins whenever a padding or
+non-padding packet is sent. With this token removal, the histogram functions
+as an overall target delay distribution for the machine while it is in that
+state.
+
+If token removal is enabled, when a padding packet is sent, a token is removed
+from the bin corresponding to the target delay. When a non-padding packet is
+sent, the actual delay from the previous packet is calculated, and the
+histogram bin corresponding to that delay is inspected.  If that bin has
+tokens remaining, it is decremented.
+
+If the bin has no tokens left, the state removes a token from a different bin,
+as specified in its token removal rule. The following token removal options
+are defined:
+  * None -- Never remove any tokens
+  * Exact -- Only remove from the target bin, if it is empty, ignore it.
+  * Higher -- Remove from the next higher non-empty bin
+  * Lower -- Remove from the next higher non-empty bin
+  * Closest -- Remove from the closest non-empty bin by index
+  * Closest_time -- Remove from the closest non-empty bin by index, by time
+
+When all bins exept the infinity bin are empty in a histogram, the padding
+machine emits the internal "bins empty" event to itself.
+
+Bin 0 and the bin before the infinity bin both have special rules for purposes
+of token removal. While removing tokens, all values less than bin 0 are
+treated as part of bin 0, and all values greater than
+start_usec+rtt_estimate+range_sec are treated as part of the bin before the
+infinity bin. Tokens are not removed from the infinity bin when non-padding is
+sent. (They are only removed when an "infinite" delay is chosen).
+
+3.1.2. Delay Probability Distribution
+
+Alternatively, a delay probability distribution can be used instead of a
+histogram, to sample padding delays.
+
+In this case, the designer also needs to specify the appropriate distribution
+parameters, and when a padding cell needs to be scheduled, the padding
+subsystem will sample a positive delay value (in microseconds) from that
+distribution (where the minimum delay is range_usec+start_usec as is the case
+for histograms).
+
+We currently support the following probability distributions:
+   Uniform, Logistic, Log-logistic, Geometric, Weibull, Pareto
+
+3.2. State Machine Selection
+
+Clients will select which of the defined available padding machines to use
+based on the conditions that these machines specify. These conditions include:
+  * How many hops the circuit must be in order for the machine to apply
+  * If the machine requires vanguards to be enabled to apply
+  * The state the circuit must be in for machines to apply (building,
+    relay early cells remaining, opened, streams currently attached).
+  * If the circuit purpose matches a set of purposes for the machine.
+  * If the target hop of the machine supports circuit padding.
+
+Clients will only select machines whose conditions fully match given circuits.
+
+A machine is represented by a positive number that can be thought of as a "menu
+option" through the list of padding machines. The currently supported padding
+state machines are:
+
+        [1]: CIRCPAD_MACHINE_CIRC_SETUP
+
+             A padding machine that obscures the initial circuit setup in an
+             attempt to hide onion services.
+
+3.3. Machine Negotiation
+
+When a machine is selected, the client uses leaky-pipe delivery to send a
+RELAY_COMMAND_PADDING_NEGOTIATE to the target hop of the machine, using the
+following trunnel relay cell payload format:
+
+  /**
+   * This command tells the relay to alter its min and max netflow
+   * timeout range values, and send padding at that rate (resuming
+   * if stopped). */
+  struct circpad_negotiate {
+    u8 version IN [0];
+    u8 command IN [CIRCPAD_COMMAND_START, CIRCPAD_COMMAND_STOP];
+
+    /** Machine type is left unbounded because we can specify
+     * new machines in the consensus */
+    u8 machine_type;
+  };
+
+Upon receipt of a RELAY_COMMAND_PADDING_NEGOTIATE cell, the middle node sends
+a RELAY_COMMAND_PADDING_NEGOTIATED with the following format:
+
+  /**
+   * This command tells the relay to alter its min and max netflow
+   * timeout range values, and send padding at that rate (resuming
+   * if stopped). */
+  struct circpad_negotiated {
+    u8 version IN [0];
+    u8 command IN [CIRCPAD_COMMAND_START, CIRCPAD_COMMAND_STOP];
+    u8 response IN [CIRCPAD_RESPONSE_OK, CIRCPAD_RESPONSE_ERR];
+
+    /** Machine type is left unbounded because we can specify
+     * new machines in the consensus */
+    u8 machine_type;
+  };
+
+The 'machine_type' field should be the same as the one from the
+PADDING_NEGOTIATE cell. This is because, as an optimization, new machines can
+be installed at the client side immediately after tearing down an old machine.
+If the response machine type does not match the current machine type, the
+response was for a previous machine, and can be ignored.
+
+If the response field is CIRCPAD_RESPONSE_OK, padding was successfully
+negotiated. If it is CIRCPAD_RESPONSE_ERR, the machine is torn down and we do
+not pad.
+
+
+4. Examples of Padding Machines
+
+In the original WTF-PAD design[2], the state machines are used as follows:
+
+The "Burst" histogram specifies the delay probabilities for sending a
+padding packet after the arrival of a non-padding data packet.
+
+The "Gap" histogram specifies the delay probabilities for sending
+another padding packet after a padding packet was just sent from this
+node. This self-triggering property of the "Gap" histogram allows the
+construction of multi-packet padding trains using a simple statistical
+distribution.
+
+Both "Gap" and "Burst" histograms each have a special "Infinity" bin,
+which means "We have decided not to send a packet".
+
+Intuitively, the burst state is used to detect when the line is idle
+(and should therefore have few or no tokens in low histogram bins). The
+lack of tokens in the low histogram bins causes the system to remain in
+the burst state until the actual application traffic either slows,
+stalls, or has a gap.
+
+The gap state is used to fill in otherwise idle periods with artificial
+payloads from the server (and should have many tokens in low bins, and
+possibly some also at higher bins). In this way, the gap state either
+generates entirely fake streams of cells, or extends real streams with
+additional cells.
+
+The Adaptive Padding Early implementation[3] uses parameterized distributions
+instead of histograms, but otherwise uses the states in the same way.
+
+It should be noted that due to our generalization of these states and their
+transition possibilities, more complicated interactions are also possible. For
+example, it is possible to simulate circuit extension, so that all circuits
+appear to continue to extend up until the RELAY_EARLY cell count is depleted.
+
+It is also possible to create machines that simulate traffic on unused
+circuits, or mimic onion service activity on clients that aren't otherwise
+using onion services.
+
+
+5. Security considerations and mitigations
+
+The risks from this proposal are primarily DoS/resource exhaustion, and
+side channels.
+
+5.1. Rate limiting
+
+Current research[2,3] indicates that padding should be be effective against
+website traffic fingerprinting at overhead rates of 50-60%. Circuit setup
+behavior can be concealed with far less overhead.
+
+We recommend that three consensus parameters be used in the event that
+the network is being overloaded from padding to such a degree that
+padding requests should be ignored:
+
+  * circpad_global_max_padding_pct
+    - The maximum percent of sent padding traffic out of total traffic
+      to allow in a tor process before ceasing to pad. Ex: 75 means
+      75 padding packets for every 100 non-padding+padding packets.
+      This definition is consistent with the overhead values in Proposal
+      #265, though it does not take node position into account.
+  * circpad_global_allowed_cells
+    - The number of padding cells that must be transmitted before the
+      global ratio limit is applied.
+
+Additionally, each machine can specify its own per-machine limits for
+the allowed cell counters and padding overhead percentages.
+
+When either global or machine limits are reached, padding is no longer
+scheduled. The machine simply becomes idle until the overhead drops below
+the threshold.
+
+Finally, the consensus can also be used to specify that clients should
+use only machines that are flagged as reduced padding, or disable circuit
+padding entirely, with the following two parameters:
+
+   * circpad_padding_reduced=1
+     - Tells clients to only use padding machines with the
+       'reduced_padding_ok' machine condition flag set.
+   * circpad_padding_disabled=1
+     - Tells clients to stop circuit padding immediately, and not negotiate
+       any further padding machines.
+
+5.2. Overhead accounting
+
+In order to monitor the quantity of padding to decide if we should alter
+these limits in the consensus, every node will publish the following
+values in a padding-counts line in its extra-info descriptor:
+
+ * read_drop_cell_count
+   - The number of RELAY_DROP cells read by this relay.
+ * write_drop_cell_count
+   - The number of RELAY_DROP cells sent by this relay.
+
+Each of these counters will be rounded to the nearest 10,000 cells. This
+rounding parameter will also be listed in the extra-info descriptor line, in
+case we change it in a later release.
+
+In the future, we may decide to introduce Laplace Noise in a similar
+manner to the hidden service statistics, to further obscure padding
+quantities.
+
+5.3. Side channels
+
+In order to prevent relays from introducing side channels by requesting
+padding from clients, all of the padding negotiation commands are only
+valid in the outgoing (from the client/OP) direction.
+
+Similarly, to prevent relays from sending malicious padding from arbitrary
+circuit positions, if RELAY_DROP cells arrive from a hop other than that
+with which padding was negotiated, this cell is counted as invalid for
+purposes of CIRC_BW control port fields, allowing the vanguards addon to
+close the circuit upon detecting this activity.
+
+-------------------
+
+1. https://gitweb.torproject.org/torspec.git/tree/proposals/251-netflow-padding.txt
+2. https://www.cs.kau.se/pulls/hot/thebasketcase-wtfpad/
+3. https://www.cs.kau.se/pulls/hot/thebasketcase-ape/

@@ -1,0 +1,115 @@
+Filename: 285-utf-8.txt
+Title: Directory documents should be standardized as UTF-8
+Author: Nick Mathewson
+Created: 13 November 2017
+Status: Open
+
+1. Summary and motivation
+
+   People frequently want to include non-ASCII text in their router
+   descriptors.  The Contact line is a favorite place to do this, but in
+   principle the platform line would also be pretty logical.
+
+   Unfortunately, there's no specified way to encode non-ASCII in our
+   directory documents.
+
+   Fortunately, almost everybody who does it, uses UTF-8 anyway.
+
+   As we move towards Rust support in Tor, we gain another motivation
+   for standarding on UTF-8, since Rust's native strings strongly prefer
+   UTF-8.
+
+   So, in this proposal, we describe a migration path to having all
+   directory documents be fully UTF-8.
+
+   (See 2.3 below for a discussion of what exactly we mean by "non-UTF-8".)
+
+2. Proposal
+
+   First, we should have Tor relays reject ContactInfo lines (and any
+   other lines copied directly into router descriptors) that are not
+   UTF-8.
+
+   At the same time, we should have authorities reject any router
+   descriptors or extrainfo documents that are not valid UTF-8.
+   Simultaneously, we can have all Tor instances reject all
+   non-directory-descriptor directory documents that are not UTF-8,
+   since none should exist today.
+
+   Finally, once the authorities have updated, we should have all Tor
+   instances reject all directory documents that are not UTF-8.  (We
+   should not take this step until the authorities have upgraded, or
+   else the behavior of updated and non-updated clients could be
+   distinguished.)
+
+2.1. Hidden service descriptors' encrypted bodies
+
+   For the encrypted bodies of hidden service descriptors, we cannot
+   reject them at the authority level, and so we need to take a slightly
+   different approach to prevent client fingerprinting attacks.
+
+   First, we should make Tor instances start warning about any hidden
+   service descriptors whose bodies, post-decryption, contain non-utf-8
+   plaintext.  At the same time, we add a consensus parameter to
+   indicate that hidden service descriptors with non-utf-8 plaintexts
+   should be rejected entirely: "reject-encrypted-non-utf-8".  If that
+   parameter is set to 1, then hidden service clients will not only
+   warn, but reject the descriptors.
+
+   Once the vast majority of clients are running versions that support
+   the "reject-encrypted-non-utf-8" parameter, that parameter can be set
+   to 1.
+
+2.2. Bridge descriptors
+
+   Since clients download bridge descriptors directly from the bridges, they
+   also need a two-phase plan as for hidden service descriptors above.  Here
+   we take the same approach as in section 2.1 above, except using the
+   parameter "reject-bridge-descriptor-non-utf-8".
+
+2.3. Which UTF-8 exactly?
+
+   We define the allowable set of UTF-8 as:
+      * Zero or mode Unicode scalar values (as defined by The Unicode
+        Standard, Version 3.1 or later), that is:
+         * Unicode code points U+00 through U+10FFFF,
+         * but excluding the code points U+D800 through U+DFFF,
+      * Excluding the scalar value U+00 (for compatibility with NUL-terminated
+        C strings),
+      * Serialized using the UTF-8 encoding scheme (as defined by The Unicode
+        Standard, Version 3.1 or later), in particular:
+         * each code point is encoded with the shortest possible encoding,
+      * Without a Unicode byte order mark (BOM, U+FEFF) at the start of the
+        descriptor. (BOMs are optional and not recommended in UTF-8. Allowing
+        a BOM would break backwards compatibility with ASCII-only Tor
+        implementations.) Byte-swapped BOMs (U+FFFE) must also be rejected.
+
+   In order to remain compatible with future versions of The Unicode Standard,
+   we allow all possible code points, including Reserved code points.
+
+   For languages with a conforming UTF-8 implementation (as defined by The
+   Unicode Standard, Version 3.1 or later), this is equivalent to well-formed
+   UTF-8, with the following additional rules:
+      * reject a BOM (U+FEFF) or byte-swapped BOM (U+FFFE) at the start of the
+        descriptor,
+      * reject U+00 at any point in the descriptor,
+      * accept all code point types used in UTF-8, including Control,
+        Private-Use, Noncharacter, and Reserved. (The Surrogate code point type
+        is not used in UTF-8.)
+
+   For languages without a conforming UTF-8 implementation, we recommend
+   checking UTF-8 conformity based on the "Well-Formed UTF-8 Byte Sequences"
+   table from The Unicode Standard, Version 11 (or later).
+
+   Note that U+00 is serialized to 0x00, but U+FEFF is serialized to 0xEFBBBF,
+   and U+FFFE is serialized to 0xEFBFBE.
+
+3. References
+
+   The Unicode Standard, Version 11, Chapter 3.
+   In particular:
+      * Unicode scalar values: D76, page 120.
+      * UTF-8 encoding form: D92, pages 125-127.
+      * Well-Formed UTF-8 Byte Sequences: Table 3-7, page 126.
+      * Byte order mark: C11, page 83; D94, page 130.
+      * UTF-8 encoding scheme: D96, pages 130.
