@@ -36,7 +36,7 @@ Ticket: #5915
 
    When the SocksPort flag defined below is present, Tor will immediately
    report a successful SOCKS handshake subject for non-onion connections.
-   If, later, tor recieves an end cell rather than a connected cell, it
+   If, later, tor receives an end cell rather than a connected cell, it
    will hang up the SOCKS connection.
 
    The requirement to omit this for onion connections is because in
